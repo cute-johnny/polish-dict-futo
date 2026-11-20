@@ -1,0 +1,1695 @@
+From 04659de069381123029cfc267ab4221bcb559390 Mon Sep 17 00:00:00 2001
+From: cute-johnny <269855522+cute-johnny@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:05:23 +0100
+Subject: [PATCH 1/2] Support dictionaries larger than 16 MiB (format v203)
+
+Binary v202 dictionaries store children and bigram pointers in at most
+3 bytes, so files over 16 MiB get truncated pointers. The keyboard then
+reads garbage (corrupt suggestions) and crashes during swipe typing.
+
+Add format version 203: same layout as v202, but the "three bytes"
+address type is stored in 4 bytes. The v2 reader gets a largeAddresses
+flag that is enabled for v203 files. Stock readers reject v203 as
+unknown instead of misreading it.
+
+Also add a patched AOSP encoder (tools/large-dict) that writes v203 and
+refuses to write corrupt v202 files over 16 MiB, plus a GitHub Actions
+workflow that builds the unstable APK. README notes this is a modified fork.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .github/workflows/build-apk.yml               |  51 ++
+ README.md                                     |   2 +
+ .../jni/src/dictionary/header/header_policy.h |   2 +
+ .../header/header_read_write_utils.cpp        |   1 +
+ ...y_structure_with_buffer_policy_factory.cpp |   5 +
+ .../bigram/bigram_list_read_write_utils.cpp   |  17 +-
+ .../bigram/bigram_list_read_write_utils.h     |   7 +-
+ .../pt_common/patricia_trie_reading_utils.cpp |  12 +-
+ .../pt_common/patricia_trie_reading_utils.h   |   5 +-
+ .../structure/v2/bigram/bigram_list_policy.h  |   8 +-
+ .../structure/v2/patricia_trie_policy.cpp     |  10 +-
+ .../structure/v2/patricia_trie_policy.h       |  11 +-
+ .../v2/ver2_patricia_trie_node_reader.cpp     |   3 +-
+ .../v2/ver2_patricia_trie_node_reader.h       |   5 +-
+ .../jni/src/dictionary/utils/format_utils.cpp |   2 +
+ .../jni/src/dictionary/utils/format_utils.h   |   2 +
+ tools/large-dict/README.md                    |  30 +
+ .../makedict/BinaryDictEncoderUtils.java      | 858 ++++++++++++++++++
+ .../latin/makedict/Ver2DictEncoder.java       | 280 ++++++
+ 19 files changed, 1281 insertions(+), 30 deletions(-)
+ create mode 100644 .github/workflows/build-apk.yml
+ create mode 100644 tools/large-dict/README.md
+ create mode 100644 tools/large-dict/src/com/android/inputmethod/latin/makedict/BinaryDictEncoderUtils.java
+ create mode 100644 tools/large-dict/src/com/android/inputmethod/latin/makedict/Ver2DictEncoder.java
+
+diff --git a/.github/workflows/build-apk.yml b/.github/workflows/build-apk.yml
+new file mode 100644
+index 0000000..9e115be
+--- /dev/null
++++ b/.github/workflows/build-apk.yml
+@@ -0,0 +1,51 @@
++name: Build APK
++
++on:
++  push:
++    branches: [large-dictionaries]
++  workflow_dispatch:
++
++jobs:
++  build:
++    runs-on: ubuntu-latest
++    timeout-minutes: 90
++    steps:
++      - name: Check out (shallow)
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 1
++          submodules: false
++
++      - name: Check out submodules (shallow, with LFS)
++        run: |
++          git lfs install
++          git submodule sync --recursive
++          git submodule update --init --recursive --depth 1 --jobs 4
++
++      - name: Set up JDK 17
++        uses: actions/setup-java@v4
++        with:
++          distribution: temurin
++          java-version: '17'
++
++      - name: Install Android NDK and CMake
++        run: |
++          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
++          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" "cmake;3.22.1" > /dev/null
++
++      - name: Set up Gradle
++        uses: gradle/actions/setup-gradle@v4
++
++      - name: Build unstable release APK
++        env:
++          VERSION_NAME: large-dict-${{ github.run_number }}
++          VERSION_CODE: ${{ github.run_number }}
++          BRANCH_NAME: ${{ github.ref_name }}
++        run: ./gradlew assembleUnstableRelease --no-daemon -s
++
++      - name: Upload APK
++        uses: actions/upload-artifact@v4
++        with:
++          name: futo-keyboard-large-dict-${{ github.run_number }}
++          path: build/outputs/apk/unstable/release/*.apk
++          if-no-files-found: error
+diff --git a/README.md b/README.md
+index baf96c9..7e4a339 100644
+--- a/README.md
++++ b/README.md
+@@ -1,5 +1,7 @@
+ # FUTO Keyboard
+ 
++> **Modified version.** This is an unofficial, non-commercial fork of FUTO Keyboard. It has been modified to support binary dictionaries larger than 16 MiB (new dictionary format version 203). See [tools/large-dict/README.md](tools/large-dict/README.md). It is not affiliated with or endorsed by FUTO. The original software is © FUTO Holdings, Inc. and is licensed under the FUTO Source First License (see [LICENSE.md](LICENSE.md)).
++
+ The goal is to make a good modern keyboard that stays offline and doesn't spy on you. This keyboard is a fork of [LatinIME, The Android Open-Source Keyboard](https://android.googlesource.com/platform/packages/inputmethods/LatinIME), with significant changes made to it.
+ 
+ Check out the [FUTO Keyboard website](https://keyboard.futo.tech/) for downloads and more information.
+diff --git a/native/jni/src/dictionary/header/header_policy.h b/native/jni/src/dictionary/header/header_policy.h
+index 1b37575..bab6870 100644
+--- a/native/jni/src/dictionary/header/header_policy.h
++++ b/native/jni/src/dictionary/header/header_policy.h
+@@ -119,6 +119,8 @@ class HeaderPolicy : public DictionaryHeaderStructurePolicy {
+                 return FormatUtils::UNKNOWN_VERSION;
+             case FormatUtils::VERSION_202:
+                 return FormatUtils::VERSION_202;
++            case FormatUtils::VERSION_203_LARGE_ADDRESSES:
++                return FormatUtils::VERSION_203_LARGE_ADDRESSES;
+             case FormatUtils::VERSION_4_ONLY_FOR_TESTING:
+                 return FormatUtils::VERSION_4_ONLY_FOR_TESTING;
+             case FormatUtils::VERSION_402:
+diff --git a/native/jni/src/dictionary/header/header_read_write_utils.cpp b/native/jni/src/dictionary/header/header_read_write_utils.cpp
+index 779f8b8..17908be 100644
+--- a/native/jni/src/dictionary/header/header_read_write_utils.cpp
++++ b/native/jni/src/dictionary/header/header_read_write_utils.cpp
+@@ -112,6 +112,7 @@ typedef DictionaryHeaderStructurePolicy::AttributeMap AttributeMap;
+         case FormatUtils::VERSION_2:
+         case FormatUtils::VERSION_201:
+         case FormatUtils::VERSION_202:
++        case FormatUtils::VERSION_203_LARGE_ADDRESSES:
+             // None of the static dictionaries (v2x) support writing
+             return false;
+         case FormatUtils::VERSION_4_ONLY_FOR_TESTING:
+diff --git a/native/jni/src/dictionary/structure/dictionary_structure_with_buffer_policy_factory.cpp b/native/jni/src/dictionary/structure/dictionary_structure_with_buffer_policy_factory.cpp
+index 7a59e88..2fbff75 100644
+--- a/native/jni/src/dictionary/structure/dictionary_structure_with_buffer_policy_factory.cpp
++++ b/native/jni/src/dictionary/structure/dictionary_structure_with_buffer_policy_factory.cpp
+@@ -116,6 +116,7 @@ template<class DictConstants, class DictBuffers, class DictBuffersPtr, class Str
+         case FormatUtils::VERSION_2:
+         case FormatUtils::VERSION_201:
+         case FormatUtils::VERSION_202:
++        case FormatUtils::VERSION_203_LARGE_ADDRESSES:
+             AKLOGE("Given path is a directory but the format is version 2xx. path: %s", path);
+             break;
+         case FormatUtils::VERSION_402: {
+@@ -183,6 +184,10 @@ template<class DictConstants, class DictBuffers, class DictBuffersPtr, class Str
+         case FormatUtils::VERSION_202:
+             return DictionaryStructureWithBufferPolicy::StructurePolicyPtr(
+                     new PatriciaTriePolicy(std::move(mmappedBuffer)));
++        case FormatUtils::VERSION_203_LARGE_ADDRESSES:
++            return DictionaryStructureWithBufferPolicy::StructurePolicyPtr(
++                    new PatriciaTriePolicy(std::move(mmappedBuffer),
++                            true /* largeAddresses */));
+         case FormatUtils::VERSION_4_ONLY_FOR_TESTING:
+         case FormatUtils::VERSION_402:
+         case FormatUtils::VERSION_403:
+diff --git a/native/jni/src/dictionary/structure/pt_common/bigram/bigram_list_read_write_utils.cpp b/native/jni/src/dictionary/structure/pt_common/bigram/bigram_list_read_write_utils.cpp
+index 64f9b66..b5ba5c1 100644
+--- a/native/jni/src/dictionary/structure/pt_common/bigram/bigram_list_read_write_utils.cpp
++++ b/native/jni/src/dictionary/structure/pt_common/bigram/bigram_list_read_write_utils.cpp
+@@ -40,7 +40,7 @@ const BigramListReadWriteUtils::BigramFlags
+ 
+ /* static */ bool BigramListReadWriteUtils::getBigramEntryPropertiesAndAdvancePosition(
+         const ReadOnlyByteArrayView buffer, BigramFlags *const outBigramFlags,
+-        int *const outTargetPtNodePos, int *const bigramEntryPos) {
++        int *const outTargetPtNodePos, int *const bigramEntryPos, const bool largeAddresses) {
+     if (static_cast<int>(buffer.size()) <= *bigramEntryPos) {
+         AKLOGE("Read invalid pos in getBigramEntryPropertiesAndAdvancePosition(). bufSize: %zd, "
+                 "bigramEntryPos: %d.", buffer.size(), *bigramEntryPos);
+@@ -51,7 +51,8 @@ const BigramListReadWriteUtils::BigramFlags
+     if (outBigramFlags) {
+         *outBigramFlags = bigramFlags;
+     }
+-    const int targetPos = getBigramAddressAndAdvancePosition(buffer, bigramFlags, bigramEntryPos);
++    const int targetPos = getBigramAddressAndAdvancePosition(buffer, bigramFlags, bigramEntryPos,
++            largeAddresses);
+     if (outTargetPtNodePos) {
+         *outTargetPtNodePos = targetPos;
+     }
+@@ -59,11 +60,11 @@ const BigramListReadWriteUtils::BigramFlags
+ }
+ 
+ /* static */ bool BigramListReadWriteUtils::skipExistingBigrams(const ReadOnlyByteArrayView buffer,
+-        int *const bigramListPos) {
++        int *const bigramListPos, const bool largeAddresses) {
+     BigramFlags flags;
+     do {
+         if (!getBigramEntryPropertiesAndAdvancePosition(buffer, &flags, 0 /* outTargetPtNodePos */,
+-                bigramListPos)) {
++                bigramListPos, largeAddresses)) {
+             return false;
+         }
+     } while(hasNext(flags));
+@@ -71,7 +72,8 @@ const BigramListReadWriteUtils::BigramFlags
+ }
+ 
+ /* static */ int BigramListReadWriteUtils::getBigramAddressAndAdvancePosition(
+-        const ReadOnlyByteArrayView buffer, const BigramFlags flags, int *const pos) {
++        const ReadOnlyByteArrayView buffer, const BigramFlags flags, int *const pos,
++        const bool largeAddresses) {
+     int offset = 0;
+     const int origin = *pos;
+     switch (MASK_ATTRIBUTE_ADDRESS_TYPE & flags) {
+@@ -82,7 +84,10 @@ const BigramListReadWriteUtils::BigramFlags
+             offset = ByteArrayUtils::readUint16AndAdvancePosition(buffer.data(), pos);
+             break;
+         case FLAG_ATTRIBUTE_ADDRESS_TYPE_THREEBYTES:
+-            offset = ByteArrayUtils::readUint24AndAdvancePosition(buffer.data(), pos);
++            offset = largeAddresses
++                    ? static_cast<int>(
++                            ByteArrayUtils::readUint32AndAdvancePosition(buffer.data(), pos))
++                    : ByteArrayUtils::readUint24AndAdvancePosition(buffer.data(), pos);
+             break;
+     }
+     if (isOffsetNegative(flags)) {
+diff --git a/native/jni/src/dictionary/structure/pt_common/bigram/bigram_list_read_write_utils.h b/native/jni/src/dictionary/structure/pt_common/bigram/bigram_list_read_write_utils.h
+index a0f7d5e..0a8333d 100644
+--- a/native/jni/src/dictionary/structure/pt_common/bigram/bigram_list_read_write_utils.h
++++ b/native/jni/src/dictionary/structure/pt_common/bigram/bigram_list_read_write_utils.h
+@@ -33,7 +33,7 @@ public:
+ 
+    static bool getBigramEntryPropertiesAndAdvancePosition(const ReadOnlyByteArrayView buffer,
+            BigramFlags *const outBigramFlags, int *const outTargetPtNodePos,
+-           int *const bigramEntryPos);
++           int *const bigramEntryPos, const bool largeAddresses = false);
+ 
+    static AK_FORCE_INLINE int getProbabilityFromFlags(const BigramFlags flags) {
+        return flags & MASK_ATTRIBUTE_PROBABILITY;
+@@ -44,7 +44,8 @@ public:
+    }
+ 
+    // Bigrams reading methods
+-   static bool skipExistingBigrams(const ReadOnlyByteArrayView buffer, int *const bigramListPos);
++   static bool skipExistingBigrams(const ReadOnlyByteArrayView buffer, int *const bigramListPos,
++           const bool largeAddresses = false);
+ 
+ private:
+    DISALLOW_IMPLICIT_CONSTRUCTORS(BigramListReadWriteUtils);
+@@ -62,7 +63,7 @@ private:
+    }
+ 
+    static int getBigramAddressAndAdvancePosition(const ReadOnlyByteArrayView buffer,
+-           const BigramFlags flags, int *const pos);
++           const BigramFlags flags, int *const pos, const bool largeAddresses);
+ };
+ } // namespace latinime
+ #endif // LATINIME_BIGRAM_LIST_READ_WRITE_UTILS_H
+diff --git a/native/jni/src/dictionary/structure/pt_common/patricia_trie_reading_utils.cpp b/native/jni/src/dictionary/structure/pt_common/patricia_trie_reading_utils.cpp
+index e2807c4..1a6af8e 100644
+--- a/native/jni/src/dictionary/structure/pt_common/patricia_trie_reading_utils.cpp
++++ b/native/jni/src/dictionary/structure/pt_common/patricia_trie_reading_utils.cpp
+@@ -112,7 +112,8 @@ const PtReadingUtils::NodeFlags PtReadingUtils::FLAG_IS_POSSIBLY_OFFENSIVE = 0x0
+ }
+ 
+ /* static */ int PtReadingUtils::readChildrenPositionAndAdvancePosition(
+-        const uint8_t *const buffer, const NodeFlags flags, int *const pos) {
++        const uint8_t *const buffer, const NodeFlags flags, int *const pos,
++        const bool largeAddresses) {
+     const int base = *pos;
+     int offset = 0;
+     switch (MASK_CHILDREN_POSITION_TYPE & flags) {
+@@ -123,7 +124,9 @@ const PtReadingUtils::NodeFlags PtReadingUtils::FLAG_IS_POSSIBLY_OFFENSIVE = 0x0
+             offset = ByteArrayUtils::readUint16AndAdvancePosition(buffer, pos);
+             break;
+         case FLAG_CHILDREN_POSITION_TYPE_THREEBYTES:
+-            offset = ByteArrayUtils::readUint24AndAdvancePosition(buffer, pos);
++            offset = largeAddresses
++                    ? static_cast<int>(ByteArrayUtils::readUint32AndAdvancePosition(buffer, pos))
++                    : ByteArrayUtils::readUint24AndAdvancePosition(buffer, pos);
+             break;
+         default:
+             // If we come here, it means we asked for the children of a word with
+@@ -138,7 +141,7 @@ const PtReadingUtils::NodeFlags PtReadingUtils::FLAG_IS_POSSIBLY_OFFENSIVE = 0x0
+         const DictionaryBigramsStructurePolicy *const bigramPolicy, const int *const codePointTable,
+         NodeFlags *const outFlags, int *const outCodePointCount, int *const outCodePoint,
+         int *const outProbability, int *const outChildrenPos, int *const outShortcutPos,
+-        int *const outBigramPos, int *const outSiblingPos) {
++        int *const outBigramPos, int *const outSiblingPos, const bool largeAddresses) {
+     int readingPos = ptNodePos;
+     const NodeFlags flags = getFlagsAndAdvancePosition(dictBuf, &readingPos);
+     *outFlags = flags;
+@@ -147,7 +150,8 @@ const PtReadingUtils::NodeFlags PtReadingUtils::FLAG_IS_POSSIBLY_OFFENSIVE = 0x0
+     *outProbability = isTerminal(flags) ?
+             readProbabilityAndAdvancePosition(dictBuf, &readingPos) : NOT_A_PROBABILITY;
+     *outChildrenPos = hasChildrenInFlags(flags) ?
+-            readChildrenPositionAndAdvancePosition(dictBuf, flags, &readingPos) : NOT_A_DICT_POS;
++            readChildrenPositionAndAdvancePosition(dictBuf, flags, &readingPos, largeAddresses)
++                    : NOT_A_DICT_POS;
+     *outShortcutPos = NOT_A_DICT_POS;
+     if (hasShortcutTargets(flags)) {
+         *outShortcutPos = readingPos;
+diff --git a/native/jni/src/dictionary/structure/pt_common/patricia_trie_reading_utils.h b/native/jni/src/dictionary/structure/pt_common/patricia_trie_reading_utils.h
+index 6a2bf5d..74b0419 100644
+--- a/native/jni/src/dictionary/structure/pt_common/patricia_trie_reading_utils.h
++++ b/native/jni/src/dictionary/structure/pt_common/patricia_trie_reading_utils.h
+@@ -48,8 +48,9 @@ class PatriciaTrieReadingUtils {
+ 
+     static int readProbabilityAndAdvancePosition(const uint8_t *const buffer, int *const pos);
+ 
++    // largeAddresses: v203 dictionaries store the "three bytes" address type in 4 bytes.
+     static int readChildrenPositionAndAdvancePosition(const uint8_t *const buffer,
+-            const NodeFlags flags, int *const pos);
++            const NodeFlags flags, int *const pos, const bool largeAddresses = false);
+ 
+     /**
+      * Node Flags
+@@ -111,7 +112,7 @@ class PatriciaTrieReadingUtils {
+             const int *const codePointTable, NodeFlags *const outFlags,
+             int *const outCodePointCount, int *const outCodePoint, int *const outProbability,
+             int *const outChildrenPos, int *const outShortcutPos, int *const outBigramPos,
+-            int *const outSiblingPos);
++            int *const outSiblingPos, const bool largeAddresses = false);
+ 
+  private:
+     DISALLOW_IMPLICIT_CONSTRUCTORS(PatriciaTrieReadingUtils);
+diff --git a/native/jni/src/dictionary/structure/v2/bigram/bigram_list_policy.h b/native/jni/src/dictionary/structure/v2/bigram/bigram_list_policy.h
+index 25081fa..a0f765b 100644
+--- a/native/jni/src/dictionary/structure/v2/bigram/bigram_list_policy.h
++++ b/native/jni/src/dictionary/structure/v2/bigram/bigram_list_policy.h
+@@ -28,7 +28,8 @@ namespace latinime {
+ 
+ class BigramListPolicy : public DictionaryBigramsStructurePolicy {
+  public:
+-    BigramListPolicy(const ReadOnlyByteArrayView buffer) : mBuffer(buffer) {}
++    BigramListPolicy(const ReadOnlyByteArrayView buffer, const bool largeAddresses = false)
++            : mBuffer(buffer), mLargeAddresses(largeAddresses) {}
+ 
+     ~BigramListPolicy() {}
+ 
+@@ -36,7 +37,7 @@ class BigramListPolicy : public DictionaryBigramsStructurePolicy {
+             int *const pos) const {
+         BigramListReadWriteUtils::BigramFlags flags;
+         if (!BigramListReadWriteUtils::getBigramEntryPropertiesAndAdvancePosition(mBuffer, &flags,
+-                outBigramPos, pos)) {
++                outBigramPos, pos, mLargeAddresses)) {
+             AKLOGE("Cannot read bigram entry. bufSize: %zd, pos: %d. ", mBuffer.size(), *pos);
+             *outProbability = NOT_A_PROBABILITY;
+             *outHasNext = false;
+@@ -47,13 +48,14 @@ class BigramListPolicy : public DictionaryBigramsStructurePolicy {
+     }
+ 
+     bool skipAllBigrams(int *const pos) const {
+-        return BigramListReadWriteUtils::skipExistingBigrams(mBuffer, pos);
++        return BigramListReadWriteUtils::skipExistingBigrams(mBuffer, pos, mLargeAddresses);
+     }
+ 
+  private:
+     DISALLOW_IMPLICIT_CONSTRUCTORS(BigramListPolicy);
+ 
+     const ReadOnlyByteArrayView mBuffer;
++    const bool mLargeAddresses;
+ };
+ } // namespace latinime
+ #endif // LATINIME_BIGRAM_LIST_POLICY_H
+diff --git a/native/jni/src/dictionary/structure/v2/patricia_trie_policy.cpp b/native/jni/src/dictionary/structure/v2/patricia_trie_policy.cpp
+index b350b43..4b539db 100644
+--- a/native/jni/src/dictionary/structure/v2/patricia_trie_policy.cpp
++++ b/native/jni/src/dictionary/structure/v2/patricia_trie_policy.cpp
+@@ -165,7 +165,7 @@ int PatriciaTriePolicy::getCodePointsAndProbabilityAndReturnCodePointCount(
+                 // Here comes the tricky part. First, read the children position.
+                 const int childrenPos = PatriciaTrieReadingUtils
+                         ::readChildrenPositionAndAdvancePosition(mBuffer.data(), flags,
+-                                &currentPos);
++                                &currentPos, mLargeAddresses);
+                 if (childrenPos > ptNodePos) {
+                     // If the children pos is greater than the position, it means the previous
+                     // PtNode, which position is stored in lastCandidatePtNodePos, was the right
+@@ -218,7 +218,7 @@ int PatriciaTriePolicy::getCodePointsAndProbabilityAndReturnCodePointCount(
+                                 &lastCandidatePtNodePos);
+                     }
+                     pos = PatriciaTrieReadingUtils::readChildrenPositionAndAdvancePosition(
+-                            mBuffer.data(), lastFlags, &lastCandidatePtNodePos);
++                            mBuffer.data(), lastFlags, &lastCandidatePtNodePos, mLargeAddresses);
+                     break;
+                 } else {
+                     // Here is a little tricky part: we come here if we found out that all children
+@@ -230,7 +230,7 @@ int PatriciaTriePolicy::getCodePointsAndProbabilityAndReturnCodePointCount(
+                     // ready to start the next one.
+                     if (PatriciaTrieReadingUtils::hasChildrenInFlags(flags)) {
+                         PatriciaTrieReadingUtils::readChildrenPositionAndAdvancePosition(
+-                                mBuffer.data(), flags, &pos);
++                                mBuffer.data(), flags, &pos, mLargeAddresses);
+                     }
+                     if (PatriciaTrieReadingUtils::hasShortcutTargets(flags)) {
+                         mShortcutListPolicy.skipAllShortcuts(&pos);
+@@ -253,7 +253,7 @@ int PatriciaTriePolicy::getCodePointsAndProbabilityAndReturnCodePointCount(
+                 // our pos is after the end of this PtNode, at the start of the next one.
+                 if (PatriciaTrieReadingUtils::hasChildrenInFlags(flags)) {
+                     PatriciaTrieReadingUtils::readChildrenPositionAndAdvancePosition(
+-                            mBuffer.data(), flags, &pos);
++                            mBuffer.data(), flags, &pos, mLargeAddresses);
+                 }
+                 if (PatriciaTrieReadingUtils::hasShortcutTargets(flags)) {
+                     mShortcutListPolicy.skipAllShortcuts(&pos);
+@@ -413,7 +413,7 @@ int PatriciaTriePolicy::createAndGetLeavingChildNode(const DicNode *const dicNod
+     PatriciaTrieReadingUtils::readPtNodeInfo(mBuffer.data(), ptNodePos, &mShortcutListPolicy,
+             &mBigramListPolicy, codePointTable, &flags, &mergedNodeCodePointCount,
+             mergedNodeCodePoints, &probability, &childrenPos, &shortcutPos, &bigramPos,
+-            &siblingPos);
++            &siblingPos, mLargeAddresses);
+     // Skip PtNodes don't start with Unicode code point because they represent non-word information.
+         if (mergedNodeCodePointCount > 0 && CharUtils::isInUnicodeSpace(mergedNodeCodePoints[0])) {
+         const int wordId = PatriciaTrieReadingUtils::isTerminal(flags) ? ptNodePos : NOT_A_WORD_ID;
+diff --git a/native/jni/src/dictionary/structure/v2/patricia_trie_policy.h b/native/jni/src/dictionary/structure/v2/patricia_trie_policy.h
+index 8edfa7d..c5afdef 100644
+--- a/native/jni/src/dictionary/structure/v2/patricia_trie_policy.h
++++ b/native/jni/src/dictionary/structure/v2/patricia_trie_policy.h
+@@ -41,14 +41,15 @@ class DicNodeVector;
+ // Max supported n-gram is bigram.
+ class PatriciaTriePolicy : public DictionaryStructureWithBufferPolicy {
+  public:
+-    PatriciaTriePolicy(MmappedBuffer::MmappedBufferPtr mmappedBuffer)
+-            : mMmappedBuffer(std::move(mmappedBuffer)),
++    PatriciaTriePolicy(MmappedBuffer::MmappedBufferPtr mmappedBuffer,
++            const bool largeAddresses = false)
++            : mMmappedBuffer(std::move(mmappedBuffer)), mLargeAddresses(largeAddresses),
+               mHeaderPolicy(mMmappedBuffer->getReadOnlyByteArrayView().data(),
+                       FormatUtils::detectFormatVersion(mMmappedBuffer->getReadOnlyByteArrayView())),
+               mBuffer(mMmappedBuffer->getReadOnlyByteArrayView().skip(mHeaderPolicy.getSize())),
+-              mBigramListPolicy(mBuffer), mShortcutListPolicy(mBuffer),
++              mBigramListPolicy(mBuffer, mLargeAddresses), mShortcutListPolicy(mBuffer),
+               mPtNodeReader(mBuffer, &mBigramListPolicy, &mShortcutListPolicy,
+-                      mHeaderPolicy.getCodePointTable()),
++                      mHeaderPolicy.getCodePointTable(), mLargeAddresses),
+               mPtNodeArrayReader(mBuffer), mTerminalPtNodePositionsForIteratingWords(),
+               mIsCorrupted(false) {}
+ 
+@@ -154,6 +155,8 @@ class PatriciaTriePolicy : public DictionaryStructureWithBufferPolicy {
+     DISALLOW_IMPLICIT_CONSTRUCTORS(PatriciaTriePolicy);
+ 
+     const MmappedBuffer::MmappedBufferPtr mMmappedBuffer;
++    // True for v203 dictionaries (4-byte addresses). Declared before the members that use it.
++    const bool mLargeAddresses;
+     const HeaderPolicy mHeaderPolicy;
+     const ReadOnlyByteArrayView mBuffer;
+     const BigramListPolicy mBigramListPolicy;
+diff --git a/native/jni/src/dictionary/structure/v2/ver2_patricia_trie_node_reader.cpp b/native/jni/src/dictionary/structure/v2/ver2_patricia_trie_node_reader.cpp
+index cbb8ead..9f60e3b 100644
+--- a/native/jni/src/dictionary/structure/v2/ver2_patricia_trie_node_reader.cpp
++++ b/native/jni/src/dictionary/structure/v2/ver2_patricia_trie_node_reader.cpp
+@@ -39,7 +39,8 @@ const PtNodeParams Ver2ParticiaTrieNodeReader::fetchPtNodeParamsInBufferFromPtNo
+     int siblingPos = NOT_A_DICT_POS;
+     PatriciaTrieReadingUtils::readPtNodeInfo(mBuffer.data(), ptNodePos, mShortcutPolicy,
+             mBigramPolicy, mCodePointTable, &flags, &mergedNodeCodePointCount, mergedNodeCodePoints,
+-            &probability, &childrenPos, &shortcutPos, &bigramPos, &siblingPos);
++            &probability, &childrenPos, &shortcutPos, &bigramPos, &siblingPos,
++            mLargeAddresses);
+     if (mergedNodeCodePointCount <= 0) {
+         AKLOGE("Empty PtNode is not allowed. Code point count: %d", mergedNodeCodePointCount);
+         ASSERT(false);
+diff --git a/native/jni/src/dictionary/structure/v2/ver2_patricia_trie_node_reader.h b/native/jni/src/dictionary/structure/v2/ver2_patricia_trie_node_reader.h
+index dc87c7c..3172264 100644
+--- a/native/jni/src/dictionary/structure/v2/ver2_patricia_trie_node_reader.h
++++ b/native/jni/src/dictionary/structure/v2/ver2_patricia_trie_node_reader.h
+@@ -34,9 +34,9 @@ class Ver2ParticiaTrieNodeReader : public PtNodeReader {
+     Ver2ParticiaTrieNodeReader(const ReadOnlyByteArrayView buffer,
+             const DictionaryBigramsStructurePolicy *const bigramPolicy,
+             const DictionaryShortcutsStructurePolicy *const shortcutPolicy,
+-            const int *const codePointTable)
++            const int *const codePointTable, const bool largeAddresses = false)
+             : mBuffer(buffer), mBigramPolicy(bigramPolicy), mShortcutPolicy(shortcutPolicy),
+-              mCodePointTable(codePointTable) {}
++              mCodePointTable(codePointTable), mLargeAddresses(largeAddresses) {}
+ 
+     virtual const PtNodeParams fetchPtNodeParamsInBufferFromPtNodePos(const int ptNodePos) const;
+ 
+@@ -47,6 +47,7 @@ class Ver2ParticiaTrieNodeReader : public PtNodeReader {
+     const DictionaryBigramsStructurePolicy *const mBigramPolicy;
+     const DictionaryShortcutsStructurePolicy *const mShortcutPolicy;
+     const int *const mCodePointTable;
++    const bool mLargeAddresses;
+ };
+ } // namespace latinime
+ #endif /* LATINIME_VER2_PATRICIA_TRIE_NODE_READER_H */
+diff --git a/native/jni/src/dictionary/utils/format_utils.cpp b/native/jni/src/dictionary/utils/format_utils.cpp
+index cef3b09..5052821 100644
+--- a/native/jni/src/dictionary/utils/format_utils.cpp
++++ b/native/jni/src/dictionary/utils/format_utils.cpp
+@@ -33,6 +33,8 @@ const size_t FormatUtils::DICTIONARY_MINIMUM_SIZE = 12;
+             return UNKNOWN_VERSION;
+         case VERSION_202:
+             return VERSION_202;
++        case VERSION_203_LARGE_ADDRESSES:
++            return VERSION_203_LARGE_ADDRESSES;
+         case VERSION_4_ONLY_FOR_TESTING:
+             return VERSION_4_ONLY_FOR_TESTING;
+         case VERSION_402:
+diff --git a/native/jni/src/dictionary/utils/format_utils.h b/native/jni/src/dictionary/utils/format_utils.h
+index 1616efc..77c3d5f 100644
+--- a/native/jni/src/dictionary/utils/format_utils.h
++++ b/native/jni/src/dictionary/utils/format_utils.h
+@@ -37,6 +37,8 @@ class FormatUtils {
+         VERSION_2 = 2,
+         VERSION_201 = 201,
+         VERSION_202 = 202,
++        // v202 layout with 4-byte addresses (for dictionaries over 16 MiB).
++        VERSION_203_LARGE_ADDRESSES = 203,
+         VERSION_4_ONLY_FOR_TESTING = 399,
+         VERSION_402 = 402,
+         VERSION_403 = 403,
+diff --git a/tools/large-dict/README.md b/tools/large-dict/README.md
+new file mode 100644
+index 0000000..0f639fc
+--- /dev/null
++++ b/tools/large-dict/README.md
+@@ -0,0 +1,30 @@
++# Large dictionaries (format version 203)
++
++Stock AOSP/FUTO binary dictionaries (format v202) store internal pointers in at
++most 3 bytes, so a `.dict` file can't be larger than 16 MiB. The stock
++`dicttool` doesn't check this. It writes truncated pointers, and the keyboard
++then shows garbage suggestions and crashes during swipe typing.
++
++This fork adds **format version 203**. It has the same layout as v202, except
++that the "three bytes" address type is stored in **4 bytes**. The native reader
++in this fork (`native/jni/src/dictionary/...`) loads v203. Stock FUTO rejects
++v203 files as an unknown version instead of misreading them.
++
++## Building a v203 dictionary
++
++`src/` contains two patched AOSP encoder classes (Apache-2.0, from
++android.googlesource.com LatinIME master). They are compiled and put on the
++classpath ahead of the stock `dicttool_aosp.jar`:
++
++```sh
++# dicttool_aosp.jar: https://codeberg.org/Helium314/aosp-dictionaries (dicttool_aosp.jar)
++mkdir -p cls
++javac -cp dicttool_aosp.jar -d cls src/com/android/inputmethod/latin/makedict/*.java
++java -Xmx6g -Ddicttool.large=true \
++     -cp cls:dicttool_aosp.jar com.android.inputmethod.latin.dicttool.Dicttool \
++     makedict -s wordlist.combined -d main_xx.dict
++```
++
++Without `-Ddicttool.large=true`, the patched encoder writes normal v202 files.
++If such a file would exceed 16 MiB, it fails with an error instead of writing a
++corrupt dictionary.
+diff --git a/tools/large-dict/src/com/android/inputmethod/latin/makedict/BinaryDictEncoderUtils.java b/tools/large-dict/src/com/android/inputmethod/latin/makedict/BinaryDictEncoderUtils.java
+new file mode 100644
+index 0000000..4b74ebb
+--- /dev/null
++++ b/tools/large-dict/src/com/android/inputmethod/latin/makedict/BinaryDictEncoderUtils.java
+@@ -0,0 +1,858 @@
++/*
++ * Copyright (C) 2013 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.inputmethod.latin.makedict;
++
++import com.android.inputmethod.latin.makedict.BinaryDictDecoderUtils.CharEncoding;
++import com.android.inputmethod.latin.makedict.FormatSpec.FormatOptions;
++import com.android.inputmethod.latin.makedict.FusionDictionary.PtNode;
++import com.android.inputmethod.latin.makedict.FusionDictionary.PtNodeArray;
++
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.Map.Entry;
++
++/**
++ * Encodes binary files for a FusionDictionary.
++ *
++ * All the methods in this class are static.
++ *
++ * TODO: Rename this class to DictEncoderUtils.
++ */
++public class BinaryDictEncoderUtils {
++
++    private static final boolean DBG = MakedictLog.DBG;
++
++    // Large-address mode (run with -Ddicttool.large=true): the "3-byte" address flag means
++    // 4 bytes, so dictionaries can exceed 16 MiB. Written as format version 203, which only
++    // a reader patched for it will load; stock readers reject it as unknown.
++    static final boolean LARGE = Boolean.getBoolean("dicttool.large");
++    static final int LARGE_VERSION = 203;
++    static int maxAddressSize() { return LARGE ? 4 : 3; }
++
++    private BinaryDictEncoderUtils() {
++        // This utility class is not publicly instantiable.
++    }
++
++    // Arbitrary limit to how much passes we consider address size compression should
++    // terminate in. At the time of this writing, our largest dictionary completes
++    // compression in five passes.
++    // If the number of passes exceeds this number, makedict bails with an exception on
++    // suspicion that a bug might be causing an infinite loop.
++    private static final int MAX_PASSES = 24;
++
++    /**
++     * Compute the binary size of the character array.
++     *
++     * If only one character, this is the size of this character. If many, it's the sum of their
++     * sizes + 1 byte for the terminator.
++     *
++     * @param characters the character array
++     * @return the size of the char array, including the terminator if any
++     */
++    static int getPtNodeCharactersSize(final int[] characters,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        int size = CharEncoding.getCharArraySize(characters, codePointToOneByteCodeMap);
++        if (characters.length > 1) size += FormatSpec.PTNODE_TERMINATOR_SIZE;
++        return size;
++    }
++
++    /**
++     * Compute the binary size of the character array in a PtNode
++     *
++     * If only one character, this is the size of this character. If many, it's the sum of their
++     * sizes + 1 byte for the terminator.
++     *
++     * @param ptNode the PtNode
++     * @return the size of the char array, including the terminator if any
++     */
++    private static int getPtNodeCharactersSize(final PtNode ptNode,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        return getPtNodeCharactersSize(ptNode.mChars, codePointToOneByteCodeMap);
++    }
++
++    /**
++     * Compute the binary size of the PtNode count for a node array.
++     * @param nodeArray the nodeArray
++     * @return the size of the PtNode count, either 1 or 2 bytes.
++     */
++    private static int getPtNodeCountSize(final PtNodeArray nodeArray) {
++        return BinaryDictIOUtils.getPtNodeCountSize(nodeArray.mData.size());
++    }
++
++    /**
++     * Compute the maximum size of a PtNode, assuming 3-byte addresses for everything.
++     *
++     * @param ptNode the PtNode to compute the size of.
++     * @return the maximum size of the PtNode.
++     */
++    private static int getPtNodeMaximumSize(final PtNode ptNode,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        int size = getNodeHeaderSize(ptNode, codePointToOneByteCodeMap);
++        if (ptNode.isTerminal()) {
++            // If terminal, one byte for the frequency.
++            size += FormatSpec.PTNODE_FREQUENCY_SIZE;
++        }
++        size += maxAddressSize(); // For children address
++        if (null != ptNode.mBigrams) {
++            size += (FormatSpec.PTNODE_ATTRIBUTE_FLAGS_SIZE
++                    + maxAddressSize())
++                    * ptNode.mBigrams.size();
++        }
++        return size;
++    }
++
++    /**
++     * Compute the maximum size of each PtNode of a PtNode array, assuming 3-byte addresses for
++     * everything, and caches it in the `mCachedSize' member of the nodes; deduce the size of
++     * the containing node array, and cache it it its 'mCachedSize' member.
++     *
++     * @param ptNodeArray the node array to compute the maximum size of.
++     */
++    private static void calculatePtNodeArrayMaximumSize(final PtNodeArray ptNodeArray,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        int size = getPtNodeCountSize(ptNodeArray);
++        for (PtNode node : ptNodeArray.mData) {
++            final int nodeSize = getPtNodeMaximumSize(node, codePointToOneByteCodeMap);
++            node.mCachedSize = nodeSize;
++            size += nodeSize;
++        }
++        ptNodeArray.mCachedSize = size;
++    }
++
++    /**
++     * Compute the size of the header (flag + [parent address] + characters size) of a PtNode.
++     *
++     * @param ptNode the PtNode of which to compute the size of the header
++     */
++    private static int getNodeHeaderSize(final PtNode ptNode,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        return FormatSpec.PTNODE_FLAGS_SIZE + getPtNodeCharactersSize(ptNode,
++                codePointToOneByteCodeMap);
++    }
++
++    /**
++     * Compute the size, in bytes, that an address will occupy.
++     *
++     * This can be used either for children addresses (which are always positive) or for
++     * attribute, which may be positive or negative but
++     * store their sign bit separately.
++     *
++     * @param address the address
++     * @return the byte size.
++     */
++    static int getByteSize(final int address) {
++        assert(LARGE || address <= FormatSpec.UINT24_MAX);
++        if (!BinaryDictIOUtils.hasChildrenAddress(address)) {
++            return 0;
++        } else if (Math.abs(address) <= FormatSpec.UINT8_MAX) {
++            return 1;
++        } else if (Math.abs(address) <= FormatSpec.UINT16_MAX) {
++            return 2;
++        } else if (!LARGE && Math.abs(address) > FormatSpec.UINT24_MAX) {
++            throw new RuntimeException("Address " + address + " needs more than 3 bytes; "
++                    + "dictionary exceeds 16 MiB (use -Ddicttool.large=true)");
++        } else {
++            return LARGE ? 4 : 3;
++        }
++    }
++
++    static int writeUIntToBuffer(final byte[] buffer, final int fromPosition, final int value,
++            final int size) {
++        int position = fromPosition;
++        switch(size) {
++            case 4:
++                buffer[position++] = (byte) ((value >> 24) & 0xFF);
++                /* fall through */
++            case 3:
++                buffer[position++] = (byte) ((value >> 16) & 0xFF);
++                /* fall through */
++            case 2:
++                buffer[position++] = (byte) ((value >> 8) & 0xFF);
++                /* fall through */
++            case 1:
++                buffer[position++] = (byte) (value & 0xFF);
++                break;
++            default:
++                /* nop */
++        }
++        return position;
++    }
++
++    static void writeUIntToStream(final OutputStream stream, final int value, final int size)
++            throws IOException {
++        switch(size) {
++            case 4:
++                stream.write((value >> 24) & 0xFF);
++                /* fall through */
++            case 3:
++                stream.write((value >> 16) & 0xFF);
++                /* fall through */
++            case 2:
++                stream.write((value >> 8) & 0xFF);
++                /* fall through */
++            case 1:
++                stream.write(value & 0xFF);
++                break;
++            default:
++                /* nop */
++        }
++    }
++
++    // End utility methods
++
++    // This method is responsible for finding a nice ordering of the nodes that favors run-time
++    // cache performance and dictionary size.
++    /* package for tests */ static ArrayList<PtNodeArray> flattenTree(
++            final PtNodeArray rootNodeArray) {
++        final int treeSize = FusionDictionary.countPtNodes(rootNodeArray);
++        MakedictLog.i("Counted nodes : " + treeSize);
++        final ArrayList<PtNodeArray> flatTree = new ArrayList<>(treeSize);
++        return flattenTreeInner(flatTree, rootNodeArray);
++    }
++
++    private static ArrayList<PtNodeArray> flattenTreeInner(final ArrayList<PtNodeArray> list,
++            final PtNodeArray ptNodeArray) {
++        // Removing the node is necessary if the tails are merged, because we would then
++        // add the same node several times when we only want it once. A number of places in
++        // the code also depends on any node being only once in the list.
++        // Merging tails can only be done if there are no attributes. Searching for attributes
++        // in LatinIME code depends on a total breadth-first ordering, which merging tails
++        // breaks. If there are no attributes, it should be fine (and reduce the file size)
++        // to merge tails, and removing the node from the list would be necessary. However,
++        // we don't merge tails because breaking the breadth-first ordering would result in
++        // extreme overhead at bigram lookup time (it would make the search function O(n) instead
++        // of the current O(log(n)), where n=number of nodes in the dictionary which is pretty
++        // high).
++        // If no nodes are ever merged, we can't have the same node twice in the list, hence
++        // searching for duplicates in unnecessary. It is also very performance consuming,
++        // since `list' is an ArrayList so it's an O(n) operation that runs on all nodes, making
++        // this simple list.remove operation O(n*n) overall. On Android this overhead is very
++        // high.
++        // For future reference, the code to remove duplicate is a simple : list.remove(node);
++        list.add(ptNodeArray);
++        final ArrayList<PtNode> branches = ptNodeArray.mData;
++        for (PtNode ptNode : branches) {
++            if (null != ptNode.mChildren) flattenTreeInner(list, ptNode.mChildren);
++        }
++        return list;
++    }
++
++    /**
++     * Get the offset from a position inside a current node array to a target node array, during
++     * update.
++     *
++     * If the current node array is before the target node array, the target node array has not
++     * been updated yet, so we should return the offset from the old position of the current node
++     * array to the old position of the target node array. If on the other hand the target is
++     * before the current node array, it already has been updated, so we should return the offset
++     * from the new position in the current node array to the new position in the target node
++     * array.
++     *
++     * @param currentNodeArray node array containing the PtNode where the offset will be written
++     * @param offsetFromStartOfCurrentNodeArray offset, in bytes, from the start of currentNodeArray
++     * @param targetNodeArray the target node array to get the offset to
++     * @return the offset to the target node array
++     */
++    private static int getOffsetToTargetNodeArrayDuringUpdate(final PtNodeArray currentNodeArray,
++            final int offsetFromStartOfCurrentNodeArray, final PtNodeArray targetNodeArray) {
++        final boolean isTargetBeforeCurrent = (targetNodeArray.mCachedAddressBeforeUpdate
++                < currentNodeArray.mCachedAddressBeforeUpdate);
++        if (isTargetBeforeCurrent) {
++            return targetNodeArray.mCachedAddressAfterUpdate
++                    - (currentNodeArray.mCachedAddressAfterUpdate
++                            + offsetFromStartOfCurrentNodeArray);
++        }
++        return targetNodeArray.mCachedAddressBeforeUpdate
++                - (currentNodeArray.mCachedAddressBeforeUpdate + offsetFromStartOfCurrentNodeArray);
++    }
++
++    /**
++     * Get the offset from a position inside a current node array to a target PtNode, during
++     * update.
++     *
++     * @param currentNodeArray node array containing the PtNode where the offset will be written
++     * @param offsetFromStartOfCurrentNodeArray offset, in bytes, from the start of currentNodeArray
++     * @param targetPtNode the target PtNode to get the offset to
++     * @return the offset to the target PtNode
++     */
++    // TODO: is there any way to factorize this method with the one above?
++    private static int getOffsetToTargetPtNodeDuringUpdate(final PtNodeArray currentNodeArray,
++            final int offsetFromStartOfCurrentNodeArray, final PtNode targetPtNode) {
++        final int oldOffsetBasePoint = currentNodeArray.mCachedAddressBeforeUpdate
++                + offsetFromStartOfCurrentNodeArray;
++        final boolean isTargetBeforeCurrent = (targetPtNode.mCachedAddressBeforeUpdate
++                < oldOffsetBasePoint);
++        // If the target is before the current node array, then its address has already been
++        // updated. We can use the AfterUpdate member, and compare it to our own member after
++        // update. Otherwise, the AfterUpdate member is not updated yet, so we need to use the
++        // BeforeUpdate member, and of course we have to compare this to our own address before
++        // update.
++        if (isTargetBeforeCurrent) {
++            final int newOffsetBasePoint = currentNodeArray.mCachedAddressAfterUpdate
++                    + offsetFromStartOfCurrentNodeArray;
++            return targetPtNode.mCachedAddressAfterUpdate - newOffsetBasePoint;
++        }
++        return targetPtNode.mCachedAddressBeforeUpdate - oldOffsetBasePoint;
++    }
++
++    /**
++     * Computes the actual node array size, based on the cached addresses of the children nodes.
++     *
++     * Each node array stores its tentative address. During dictionary address computing, these
++     * are not final, but they can be used to compute the node array size (the node array size
++     * depends on the address of the children because the number of bytes necessary to store an
++     * address depends on its numeric value. The return value indicates whether the node array
++     * contents (as in, any of the addresses stored in the cache fields) have changed with
++     * respect to their previous value.
++     *
++     * @param ptNodeArray the node array to compute the size of.
++     * @param dict the dictionary in which the word/attributes are to be found.
++     * @return false if none of the cached addresses inside the node array changed, true otherwise.
++     */
++    private static boolean computeActualPtNodeArraySize(final PtNodeArray ptNodeArray,
++            final FusionDictionary dict,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        boolean changed = false;
++        int size = getPtNodeCountSize(ptNodeArray);
++        for (PtNode ptNode : ptNodeArray.mData) {
++            ptNode.mCachedAddressAfterUpdate = ptNodeArray.mCachedAddressAfterUpdate + size;
++            if (ptNode.mCachedAddressAfterUpdate != ptNode.mCachedAddressBeforeUpdate) {
++                changed = true;
++            }
++            int nodeSize = getNodeHeaderSize(ptNode, codePointToOneByteCodeMap);
++            if (ptNode.isTerminal()) {
++                nodeSize += FormatSpec.PTNODE_FREQUENCY_SIZE;
++            }
++            if (null != ptNode.mChildren) {
++                nodeSize += getByteSize(getOffsetToTargetNodeArrayDuringUpdate(ptNodeArray,
++                        nodeSize + size, ptNode.mChildren));
++            }
++            if (null != ptNode.mBigrams) {
++                for (WeightedString bigram : ptNode.mBigrams) {
++                    final int offset = getOffsetToTargetPtNodeDuringUpdate(ptNodeArray,
++                            nodeSize + size + FormatSpec.PTNODE_ATTRIBUTE_FLAGS_SIZE,
++                            FusionDictionary.findWordInTree(dict.mRootNodeArray, bigram.mWord));
++                    nodeSize += getByteSize(offset) + FormatSpec.PTNODE_ATTRIBUTE_FLAGS_SIZE;
++                }
++            }
++            ptNode.mCachedSize = nodeSize;
++            size += nodeSize;
++        }
++        if (ptNodeArray.mCachedSize != size) {
++            ptNodeArray.mCachedSize = size;
++            changed = true;
++        }
++        return changed;
++    }
++
++    /**
++     * Initializes the cached addresses of node arrays and their containing nodes from their size.
++     *
++     * @param flatNodes the list of node arrays.
++     * @return the byte size of the entire stack.
++     */
++    private static int initializePtNodeArraysCachedAddresses(
++            final ArrayList<PtNodeArray> flatNodes) {
++        int nodeArrayOffset = 0;
++        for (final PtNodeArray nodeArray : flatNodes) {
++            nodeArray.mCachedAddressBeforeUpdate = nodeArrayOffset;
++            int nodeCountSize = getPtNodeCountSize(nodeArray);
++            int nodeffset = 0;
++            for (final PtNode ptNode : nodeArray.mData) {
++                ptNode.mCachedAddressBeforeUpdate = ptNode.mCachedAddressAfterUpdate =
++                        nodeCountSize + nodeArrayOffset + nodeffset;
++                nodeffset += ptNode.mCachedSize;
++            }
++            nodeArrayOffset += nodeArray.mCachedSize;
++        }
++        return nodeArrayOffset;
++    }
++
++    /**
++     * Updates the cached addresses of node arrays after recomputing their new positions.
++     *
++     * @param flatNodes the list of node arrays.
++     */
++    private static void updatePtNodeArraysCachedAddresses(final ArrayList<PtNodeArray> flatNodes) {
++        for (final PtNodeArray nodeArray : flatNodes) {
++            nodeArray.mCachedAddressBeforeUpdate = nodeArray.mCachedAddressAfterUpdate;
++            for (final PtNode ptNode : nodeArray.mData) {
++                ptNode.mCachedAddressBeforeUpdate = ptNode.mCachedAddressAfterUpdate;
++            }
++        }
++    }
++
++    /**
++     * Compute the addresses and sizes of an ordered list of PtNode arrays.
++     *
++     * This method takes a list of PtNode arrays and will update their cached address and size
++     * values so that they can be written into a file. It determines the smallest size each of the
++     * PtNode arrays can be given the addresses of its children and attributes, and store that into
++     * each PtNode.
++     * The order of the PtNode is given by the order of the array. This method makes no effort
++     * to find a good order; it only mechanically computes the size this order results in.
++     *
++     * @param dict the dictionary
++     * @param flatNodes the ordered list of PtNode arrays
++     * @return the same array it was passed. The nodes have been updated for address and size.
++     */
++    /* package */ static ArrayList<PtNodeArray> computeAddresses(final FusionDictionary dict,
++            final ArrayList<PtNodeArray> flatNodes,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        // First get the worst possible sizes and offsets
++        for (final PtNodeArray n : flatNodes) {
++            calculatePtNodeArrayMaximumSize(n, codePointToOneByteCodeMap);
++        }
++        final int offset = initializePtNodeArraysCachedAddresses(flatNodes);
++
++        MakedictLog.i("Compressing the array addresses. Original size : " + offset);
++        MakedictLog.i("(Recursively seen size : " + offset + ")");
++
++        int passes = 0;
++        boolean changesDone = false;
++        do {
++            changesDone = false;
++            int ptNodeArrayStartOffset = 0;
++            for (final PtNodeArray ptNodeArray : flatNodes) {
++                ptNodeArray.mCachedAddressAfterUpdate = ptNodeArrayStartOffset;
++                final int oldNodeArraySize = ptNodeArray.mCachedSize;
++                final boolean changed = computeActualPtNodeArraySize(ptNodeArray, dict,
++                        codePointToOneByteCodeMap);
++                final int newNodeArraySize = ptNodeArray.mCachedSize;
++                if (oldNodeArraySize < newNodeArraySize) {
++                    throw new RuntimeException("Increased size ?!");
++                }
++                ptNodeArrayStartOffset += newNodeArraySize;
++                changesDone |= changed;
++            }
++            updatePtNodeArraysCachedAddresses(flatNodes);
++            ++passes;
++            if (passes > MAX_PASSES) throw new RuntimeException("Too many passes - probably a bug");
++        } while (changesDone);
++
++        final PtNodeArray lastPtNodeArray = flatNodes.get(flatNodes.size() - 1);
++        MakedictLog.i("Compression complete in " + passes + " passes.");
++        MakedictLog.i("After address compression : "
++                + (lastPtNodeArray.mCachedAddressAfterUpdate + lastPtNodeArray.mCachedSize));
++
++        return flatNodes;
++    }
++
++    /**
++     * Validity-checking method.
++     *
++     * This method checks a list of PtNode arrays for juxtaposition, that is, it will do
++     * nothing if each node array's cached address is actually the previous node array's address
++     * plus the previous node's size.
++     * If this is not the case, it will throw an exception.
++     *
++     * @param arrays the list of node arrays to check
++     */
++    /* package */ static void checkFlatPtNodeArrayList(final ArrayList<PtNodeArray> arrays) {
++        int offset = 0;
++        int index = 0;
++        for (final PtNodeArray ptNodeArray : arrays) {
++            // BeforeUpdate and AfterUpdate addresses are the same here, so it does not matter
++            // which we use.
++            if (ptNodeArray.mCachedAddressAfterUpdate != offset) {
++                throw new RuntimeException("Wrong address for node " + index
++                        + " : expected " + offset + ", got " +
++                        ptNodeArray.mCachedAddressAfterUpdate);
++            }
++            ++index;
++            offset += ptNodeArray.mCachedSize;
++        }
++    }
++
++    /**
++     * Helper method to write a children position to a file.
++     *
++     * @param buffer the buffer to write to.
++     * @param fromIndex the index in the buffer to write the address to.
++     * @param position the position to write.
++     * @return the size in bytes the address actually took.
++     */
++    /* package */ static int writeChildrenPosition(final byte[] buffer, final int fromIndex,
++            final int position) {
++        int index = fromIndex;
++        switch (getByteSize(position)) {
++        case 1:
++            buffer[index++] = (byte)position;
++            return 1;
++        case 2:
++            buffer[index++] = (byte)(0xFF & (position >> 8));
++            buffer[index++] = (byte)(0xFF & position);
++            return 2;
++        case 3:
++            buffer[index++] = (byte)(0xFF & (position >> 16));
++            buffer[index++] = (byte)(0xFF & (position >> 8));
++            buffer[index++] = (byte)(0xFF & position);
++            return 3;
++        case 4:
++            buffer[index++] = (byte)(0xFF & (position >> 24));
++            buffer[index++] = (byte)(0xFF & (position >> 16));
++            buffer[index++] = (byte)(0xFF & (position >> 8));
++            buffer[index++] = (byte)(0xFF & position);
++            return 4;
++        case 0:
++            return 0;
++        default:
++            throw new RuntimeException("Position " + position + " has a strange size");
++        }
++    }
++
++    /**
++     * Makes the flag value for a PtNode.
++     *
++     * @param hasMultipleChars whether the PtNode has multiple chars.
++     * @param isTerminal whether the PtNode is terminal.
++     * @param childrenAddressSize the size of a children address.
++     * @param hasBigrams whether the PtNode has bigrams.
++     * @param isNotAWord whether the PtNode is not a word.
++     * @param isPossiblyOffensive whether the PtNode is a possibly offensive entry.
++     * @return the flags
++     */
++    static int makePtNodeFlags(final boolean hasMultipleChars, final boolean isTerminal,
++            final int childrenAddressSize, final boolean hasBigrams,
++            final boolean isNotAWord, final boolean isPossiblyOffensive) {
++        byte flags = 0;
++        if (hasMultipleChars) flags |= FormatSpec.FLAG_HAS_MULTIPLE_CHARS;
++        if (isTerminal) flags |= FormatSpec.FLAG_IS_TERMINAL;
++        switch (childrenAddressSize) {
++            case 1:
++                flags |= FormatSpec.FLAG_CHILDREN_ADDRESS_TYPE_ONEBYTE;
++                break;
++            case 2:
++                flags |= FormatSpec.FLAG_CHILDREN_ADDRESS_TYPE_TWOBYTES;
++                break;
++            case 3:
++            case 4:
++                flags |= FormatSpec.FLAG_CHILDREN_ADDRESS_TYPE_THREEBYTES;
++                break;
++            case 0:
++                flags |= FormatSpec.FLAG_CHILDREN_ADDRESS_TYPE_NOADDRESS;
++                break;
++            default:
++                throw new RuntimeException("Node with a strange address");
++        }
++        if (hasBigrams) flags |= FormatSpec.FLAG_HAS_BIGRAMS;
++        if (isNotAWord) flags |= FormatSpec.FLAG_IS_NOT_A_WORD;
++        if (isPossiblyOffensive) flags |= FormatSpec.FLAG_IS_POSSIBLY_OFFENSIVE;
++        return flags;
++    }
++
++    /* package */ static byte makePtNodeFlags(final PtNode node, final int childrenOffset) {
++        return (byte) makePtNodeFlags(node.mChars.length > 1, node.isTerminal(),
++                getByteSize(childrenOffset),
++                node.mBigrams != null && !node.mBigrams.isEmpty(),
++                node.mIsNotAWord, node.mIsPossiblyOffensive);
++    }
++
++    /**
++     * Makes the flag value for a bigram.
++     *
++     * @param more whether there are more bigrams after this one.
++     * @param offset the offset of the bigram.
++     * @param bigramFrequency the frequency of the bigram, 0..255.
++     * @param unigramFrequency the unigram frequency of the same word, 0..255.
++     * @param word the second bigram, for debugging purposes
++     * @return the flags
++     */
++    /* package */ static int makeBigramFlags(final boolean more, final int offset,
++            final int bigramFrequency, final int unigramFrequency, final String word) {
++        int bigramFlags = (more ? FormatSpec.FLAG_BIGRAM_SHORTCUT_ATTR_HAS_NEXT : 0)
++                + (offset < 0 ? FormatSpec.FLAG_BIGRAM_ATTR_OFFSET_NEGATIVE : 0);
++        switch (getByteSize(offset)) {
++        case 1:
++            bigramFlags |= FormatSpec.FLAG_BIGRAM_ATTR_ADDRESS_TYPE_ONEBYTE;
++            break;
++        case 2:
++            bigramFlags |= FormatSpec.FLAG_BIGRAM_ATTR_ADDRESS_TYPE_TWOBYTES;
++            break;
++        case 3:
++        case 4:
++            bigramFlags |= FormatSpec.FLAG_BIGRAM_ATTR_ADDRESS_TYPE_THREEBYTES;
++            break;
++        default:
++            throw new RuntimeException("Strange offset size");
++        }
++        final int frequency;
++        if (unigramFrequency > bigramFrequency) {
++            MakedictLog.e("Unigram freq is superior to bigram freq for \"" + word
++                    + "\". Bigram freq is " + bigramFrequency + ", unigram freq for "
++                    + word + " is " + unigramFrequency);
++            frequency = unigramFrequency;
++        } else {
++            frequency = bigramFrequency;
++        }
++        bigramFlags += getBigramFrequencyDiff(unigramFrequency, frequency)
++                & FormatSpec.FLAG_BIGRAM_SHORTCUT_ATTR_FREQUENCY;
++        return bigramFlags;
++    }
++
++    public static int getBigramFrequencyDiff(final int unigramFrequency,
++            final int bigramFrequency) {
++        // We compute the difference between 255 (which means probability = 1) and the
++        // unigram score. We split this into a number of discrete steps.
++        // Now, the steps are numbered 0~15; 0 represents an increase of 1 step while 15
++        // represents an increase of 16 steps: a value of 15 will be interpreted as the median
++        // value of the 16th step. In all justice, if the bigram frequency is low enough to be
++        // rounded below the first step (which means it is less than half a step higher than the
++        // unigram frequency) then the unigram frequency itself is the best approximation of the
++        // bigram freq that we could possibly supply, hence we should *not* include this bigram
++        // in the file at all.
++        // until this is done, we'll write 0 and slightly overestimate this case.
++        // In other words, 0 means "between 0.5 step and 1.5 step", 1 means "between 1.5 step
++        // and 2.5 steps", and 15 means "between 15.5 steps and 16.5 steps". So we want to
++        // divide our range [unigramFreq..MAX_TERMINAL_FREQUENCY] in 16.5 steps to get the
++        // step size. Then we compute the start of the first step (the one where value 0 starts)
++        // by adding half-a-step to the unigramFrequency. From there, we compute the integer
++        // number of steps to the bigramFrequency. One last thing: we want our steps to include
++        // their lower bound and exclude their higher bound so we need to have the first step
++        // start at exactly 1 unit higher than floor(unigramFreq + half a step).
++        // Note : to reconstruct the score, the dictionary reader will need to divide
++        // MAX_TERMINAL_FREQUENCY - unigramFreq by 16.5 likewise to get the value of the step,
++        // and add (discretizedFrequency + 0.5 + 0.5) times this value to get the best
++        // approximation. (0.5 to get the first step start, and 0.5 to get the middle of the
++        // step pointed by the discretized frequency.
++        final float stepSize =
++                (FormatSpec.MAX_TERMINAL_FREQUENCY - unigramFrequency)
++                / (1.5f + FormatSpec.MAX_BIGRAM_FREQUENCY);
++        final float firstStepStart = 1 + unigramFrequency + (stepSize / 2.0f);
++        final int discretizedFrequency = (int)((bigramFrequency - firstStepStart) / stepSize);
++        // If the bigram freq is less than half-a-step higher than the unigram freq, we get -1
++        // here. The best approximation would be the unigram freq itself, so we should not
++        // include this bigram in the dictionary. For now, register as 0, and live with the
++        // small over-estimation that we get in this case. TODO: actually remove this bigram
++        // if discretizedFrequency < 0.
++        return discretizedFrequency > 0 ? discretizedFrequency : 0;
++    }
++
++    /* package */ static int getChildrenPosition(final PtNode ptNode,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        int positionOfChildrenPosField = ptNode.mCachedAddressAfterUpdate
++                + getNodeHeaderSize(ptNode, codePointToOneByteCodeMap);
++        if (ptNode.isTerminal()) {
++            // A terminal node has the frequency.
++            // If positionOfChildrenPosField is incorrect, we may crash when jumping to the children
++            // position.
++            positionOfChildrenPosField += FormatSpec.PTNODE_FREQUENCY_SIZE;
++        }
++        return null == ptNode.mChildren ? FormatSpec.NO_CHILDREN_ADDRESS
++                : ptNode.mChildren.mCachedAddressAfterUpdate - positionOfChildrenPosField;
++    }
++
++    /**
++     * Write a PtNodeArray. The PtNodeArray is expected to have its final position cached.
++     *
++     * @param dict the dictionary the node array is a part of (for relative offsets).
++     * @param dictEncoder the dictionary encoder.
++     * @param ptNodeArray the node array to write.
++     * @param codePointToOneByteCodeMap the map to convert the code points.
++     */
++    /* package */ static void writePlacedPtNodeArray(final FusionDictionary dict,
++            final DictEncoder dictEncoder, final PtNodeArray ptNodeArray,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        // TODO: Make the code in common with BinaryDictIOUtils#writePtNode
++        dictEncoder.setPosition(ptNodeArray.mCachedAddressAfterUpdate);
++
++        final int ptNodeCount = ptNodeArray.mData.size();
++        dictEncoder.writePtNodeCount(ptNodeCount);
++        for (int i = 0; i < ptNodeCount; ++i) {
++            final PtNode ptNode = ptNodeArray.mData.get(i);
++            if (dictEncoder.getPosition() != ptNode.mCachedAddressAfterUpdate) {
++                throw new RuntimeException("Bug: write index is not the same as the cached address "
++                        + "of the node : " + dictEncoder.getPosition() + " <> "
++                        + ptNode.mCachedAddressAfterUpdate);
++            }
++            // Validity checks.
++            if (DBG && ptNode.getProbability() > FormatSpec.MAX_TERMINAL_FREQUENCY) {
++                throw new RuntimeException("A node has a frequency > "
++                        + FormatSpec.MAX_TERMINAL_FREQUENCY
++                        + " : " + ptNode.mProbabilityInfo.toString());
++            }
++            dictEncoder.writePtNode(ptNode, dict, codePointToOneByteCodeMap);
++        }
++        if (dictEncoder.getPosition() != ptNodeArray.mCachedAddressAfterUpdate
++                + ptNodeArray.mCachedSize) {
++            throw new RuntimeException("Not the same size : written "
++                     + (dictEncoder.getPosition() - ptNodeArray.mCachedAddressAfterUpdate)
++                     + " bytes from a node that should have " + ptNodeArray.mCachedSize + " bytes");
++        }
++    }
++
++    /**
++     * Dumps a collection of useful statistics about a list of PtNode arrays.
++     *
++     * This prints purely informative stuff, like the total estimated file size, the
++     * number of PtNode arrays, of PtNodes, the repartition of each address size, etc
++     *
++     * @param ptNodeArrays the list of PtNode arrays.
++     */
++    /* package */ static void showStatistics(ArrayList<PtNodeArray> ptNodeArrays) {
++        int firstTerminalAddress = Integer.MAX_VALUE;
++        int lastTerminalAddress = Integer.MIN_VALUE;
++        int size = 0;
++        int ptNodes = 0;
++        int maxNodes = 0;
++        int maxRuns = 0;
++        for (final PtNodeArray ptNodeArray : ptNodeArrays) {
++            if (maxNodes < ptNodeArray.mData.size()) maxNodes = ptNodeArray.mData.size();
++            for (final PtNode ptNode : ptNodeArray.mData) {
++                ++ptNodes;
++                if (ptNode.mChars.length > maxRuns) maxRuns = ptNode.mChars.length;
++                if (ptNode.isTerminal()) {
++                    if (ptNodeArray.mCachedAddressAfterUpdate < firstTerminalAddress)
++                        firstTerminalAddress = ptNodeArray.mCachedAddressAfterUpdate;
++                    if (ptNodeArray.mCachedAddressAfterUpdate > lastTerminalAddress)
++                        lastTerminalAddress = ptNodeArray.mCachedAddressAfterUpdate;
++                }
++            }
++            if (ptNodeArray.mCachedAddressAfterUpdate + ptNodeArray.mCachedSize > size) {
++                size = ptNodeArray.mCachedAddressAfterUpdate + ptNodeArray.mCachedSize;
++            }
++        }
++        final int[] ptNodeCounts = new int[maxNodes + 1];
++        final int[] runCounts = new int[maxRuns + 1];
++        for (final PtNodeArray ptNodeArray : ptNodeArrays) {
++            ++ptNodeCounts[ptNodeArray.mData.size()];
++            for (final PtNode ptNode : ptNodeArray.mData) {
++                ++runCounts[ptNode.mChars.length];
++            }
++        }
++
++        MakedictLog.i("Statistics:\n"
++                + "  Total file size " + size + "\n"
++                + "  " + ptNodeArrays.size() + " node arrays\n"
++                + "  " + ptNodes + " PtNodes (" + ((float)ptNodes / ptNodeArrays.size())
++                        + " PtNodes per node)\n"
++                + "  First terminal at " + firstTerminalAddress + "\n"
++                + "  Last terminal at " + lastTerminalAddress + "\n"
++                + "  PtNode stats : max = " + maxNodes);
++    }
++
++    /**
++     * Writes a file header to an output stream.
++     *
++     * @param destination the stream to write the file header to.
++     * @param dict the dictionary to write.
++     * @param formatOptions file format options.
++     * @param codePointOccurrenceArray code points ordered by occurrence count.
++     * @return the size of the header.
++     */
++    /* package */ static int writeDictionaryHeader(final OutputStream destination,
++            final FusionDictionary dict, final FormatOptions formatOptions,
++            final ArrayList<Entry<Integer, Integer>> codePointOccurrenceArray)
++                    throws IOException, UnsupportedFormatException {
++        final int version = formatOptions.mVersion;
++        if ((version >= FormatSpec.MINIMUM_SUPPORTED_STATIC_VERSION &&
++                version <= FormatSpec.MAXIMUM_SUPPORTED_STATIC_VERSION) || (
++                version >= FormatSpec.MINIMUM_SUPPORTED_DYNAMIC_VERSION &&
++                version <= FormatSpec.MAXIMUM_SUPPORTED_DYNAMIC_VERSION)) {
++            // Dictionary is valid
++        } else {
++            throw new UnsupportedFormatException("Requested file format version " + version
++                    + ", but this implementation only supports static versions "
++                    + FormatSpec.MINIMUM_SUPPORTED_STATIC_VERSION + " through "
++                    + FormatSpec.MAXIMUM_SUPPORTED_STATIC_VERSION + " and dynamic versions "
++                    + FormatSpec.MINIMUM_SUPPORTED_DYNAMIC_VERSION + " through "
++                    + FormatSpec.MAXIMUM_SUPPORTED_DYNAMIC_VERSION);
++        }
++
++        ByteArrayOutputStream headerBuffer = new ByteArrayOutputStream(256);
++
++        // The magic number in big-endian order.
++        // Magic number for all versions.
++        headerBuffer.write((byte) (0xFF & (FormatSpec.MAGIC_NUMBER >> 24)));
++        headerBuffer.write((byte) (0xFF & (FormatSpec.MAGIC_NUMBER >> 16)));
++        headerBuffer.write((byte) (0xFF & (FormatSpec.MAGIC_NUMBER >> 8)));
++        headerBuffer.write((byte) (0xFF & FormatSpec.MAGIC_NUMBER));
++        // Dictionary version.
++        final int writtenVersion = LARGE ? LARGE_VERSION : version;
++        headerBuffer.write((byte) (0xFF & (writtenVersion >> 8)));
++        headerBuffer.write((byte) (0xFF & writtenVersion));
++
++        // Options flags
++        // TODO: Remove this field.
++        final int options = 0;
++        headerBuffer.write((byte) (0xFF & (options >> 8)));
++        headerBuffer.write((byte) (0xFF & options));
++        final int headerSizeOffset = headerBuffer.size();
++        // Placeholder to be written later with header size.
++        for (int i = 0; i < 4; ++i) {
++            headerBuffer.write(0);
++        }
++        // Write out the options.
++        for (final String key : dict.mOptions.mAttributes.keySet()) {
++            final String value = dict.mOptions.mAttributes.get(key);
++            CharEncoding.writeString(headerBuffer, key, null);
++            CharEncoding.writeString(headerBuffer, value, null);
++        }
++        // Write out the codePointTable if there is codePointOccurrenceArray.
++        if (codePointOccurrenceArray != null) {
++            final String codePointTableString =
++                    encodeCodePointTable(codePointOccurrenceArray);
++            CharEncoding.writeString(headerBuffer, DictionaryHeader.CODE_POINT_TABLE_KEY, null);
++            CharEncoding.writeString(headerBuffer, codePointTableString, null);
++        }
++        final int size = headerBuffer.size();
++        final byte[] bytes = headerBuffer.toByteArray();
++        // Write out the header size.
++        bytes[headerSizeOffset] = (byte) (0xFF & (size >> 24));
++        bytes[headerSizeOffset + 1] = (byte) (0xFF & (size >> 16));
++        bytes[headerSizeOffset + 2] = (byte) (0xFF & (size >> 8));
++        bytes[headerSizeOffset + 3] = (byte) (0xFF & (size >> 0));
++        destination.write(bytes);
++
++        headerBuffer.close();
++        return size;
++    }
++
++    static final class CodePointTable {
++        final HashMap<Integer, Integer> mCodePointToOneByteCodeMap;
++        final ArrayList<Entry<Integer, Integer>> mCodePointOccurrenceArray;
++
++        // Let code point table empty for version 200 dictionary which used in test
++        CodePointTable() {
++            mCodePointToOneByteCodeMap = null;
++            mCodePointOccurrenceArray = null;
++        }
++
++        CodePointTable(final HashMap<Integer, Integer> codePointToOneByteCodeMap,
++                final ArrayList<Entry<Integer, Integer>> codePointOccurrenceArray) {
++            mCodePointToOneByteCodeMap = codePointToOneByteCodeMap;
++            mCodePointOccurrenceArray = codePointOccurrenceArray;
++        }
++    }
++
++    private static String encodeCodePointTable(
++            final ArrayList<Entry<Integer, Integer>> codePointOccurrenceArray) {
++        final StringBuilder codePointTableString = new StringBuilder();
++        int currentCodePointTableIndex = FormatSpec.MINIMAL_ONE_BYTE_CHARACTER_VALUE;
++        for (final Entry<Integer, Integer> entry : codePointOccurrenceArray) {
++            // Native reads the table as a string
++            codePointTableString.appendCodePoint(entry.getKey());
++            if (FormatSpec.MAXIMAL_ONE_BYTE_CHARACTER_VALUE < ++currentCodePointTableIndex) {
++                break;
++            }
++        }
++        return codePointTableString.toString();
++    }
++}
+diff --git a/tools/large-dict/src/com/android/inputmethod/latin/makedict/Ver2DictEncoder.java b/tools/large-dict/src/com/android/inputmethod/latin/makedict/Ver2DictEncoder.java
+new file mode 100644
+index 0000000..b5694ca
+--- /dev/null
++++ b/tools/large-dict/src/com/android/inputmethod/latin/makedict/Ver2DictEncoder.java
+@@ -0,0 +1,280 @@
++/*
++ * Copyright (C) 2013 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.inputmethod.latin.makedict;
++
++import com.android.inputmethod.annotations.UsedForTesting;
++import com.android.inputmethod.latin.makedict.BinaryDictDecoderUtils.CharEncoding;
++import com.android.inputmethod.latin.makedict.BinaryDictEncoderUtils.CodePointTable;
++import com.android.inputmethod.latin.makedict.FormatSpec.FormatOptions;
++import com.android.inputmethod.latin.makedict.FusionDictionary.PtNode;
++import com.android.inputmethod.latin.makedict.FusionDictionary.PtNodeArray;
++
++import java.io.File;
++import java.io.FileNotFoundException;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.Iterator;
++import java.util.Map.Entry;
++import java.util.Objects;
++
++/**
++ * An implementation of DictEncoder for version 2 binary dictionary.
++ */
++@UsedForTesting
++public class Ver2DictEncoder implements DictEncoder {
++
++    private final File mDictFile;
++    private OutputStream mOutStream;
++    private byte[] mBuffer;
++    private int mPosition;
++    private final int mCodePointTableMode;
++    public static final int CODE_POINT_TABLE_OFF = 0;
++    public static final int CODE_POINT_TABLE_ON = 1;
++
++    @UsedForTesting
++    public Ver2DictEncoder(final File dictFile, final int codePointTableMode) {
++        mDictFile = dictFile;
++        mOutStream = null;
++        mBuffer = null;
++        mCodePointTableMode = codePointTableMode;
++    }
++
++    // This constructor is used only by BinaryDictOffdeviceUtilsTests.
++    // If you want to use this in the production code, you should consider keeping consistency of
++    // the interface of Ver3DictDecoder by using factory.
++    @UsedForTesting
++    public Ver2DictEncoder(final OutputStream outStream) {
++        mDictFile = null;
++        mOutStream = outStream;
++        mCodePointTableMode = CODE_POINT_TABLE_OFF;
++    }
++
++    private void openStream() throws FileNotFoundException {
++        mOutStream = new FileOutputStream(mDictFile);
++    }
++
++    private void close() throws IOException {
++        if (mOutStream != null) {
++            mOutStream.close();
++            mOutStream = null;
++        }
++    }
++
++    // Package for testing
++    static CodePointTable makeCodePointTable(final FusionDictionary dict) {
++        final HashMap<Integer, Integer> codePointOccurrenceCounts = new HashMap<>();
++        for (final WordProperty word : dict) {
++            // Store per code point occurrence
++            final String wordString = word.mWord;
++            for (int i = 0; i < wordString.length(); ++i) {
++                final int codePoint = Character.codePointAt(wordString, i);
++                if (codePointOccurrenceCounts.containsKey(codePoint)) {
++                    codePointOccurrenceCounts.put(codePoint,
++                            codePointOccurrenceCounts.get(codePoint) + 1);
++                } else {
++                    codePointOccurrenceCounts.put(codePoint, 1);
++                }
++            }
++        }
++        final ArrayList<Entry<Integer, Integer>> codePointOccurrenceArray =
++                new ArrayList<>(codePointOccurrenceCounts.entrySet());
++        // Descending order sort by occurrence (value side)
++        Collections.sort(codePointOccurrenceArray, new Comparator<Entry<Integer, Integer>>() {
++            @Override
++            public int compare(final Entry<Integer, Integer> a, final Entry<Integer, Integer> b) {
++                if (!Objects.equals(a.getValue(), b.getValue())) {
++                    return b.getValue().compareTo(a.getValue());
++                }
++                return b.getKey().compareTo(a.getKey());
++            }
++        });
++        int currentCodePointTableIndex = FormatSpec.MINIMAL_ONE_BYTE_CHARACTER_VALUE;
++        // Temporary map for writing of nodes
++        final HashMap<Integer, Integer> codePointToOneByteCodeMap = new HashMap<>();
++        for (final Entry<Integer, Integer> entry : codePointOccurrenceArray) {
++            // Put a relation from the original code point to the one byte code.
++            codePointToOneByteCodeMap.put(entry.getKey(), currentCodePointTableIndex);
++            if (FormatSpec.MAXIMAL_ONE_BYTE_CHARACTER_VALUE < ++currentCodePointTableIndex) {
++                break;
++            }
++        }
++        // codePointToOneByteCodeMap for writing the trie
++        // codePointOccurrenceArray for writing the header
++        return new CodePointTable(codePointToOneByteCodeMap, codePointOccurrenceArray);
++    }
++
++    @Override
++    public void writeDictionary(final FusionDictionary dict, final FormatOptions formatOptions)
++            throws IOException, UnsupportedFormatException {
++        // We no longer support anything but the latest version of v2.
++        if (formatOptions.mVersion != FormatSpec.VERSION202) {
++            throw new UnsupportedFormatException(
++                    "The given format options has wrong version number : "
++                    + formatOptions.mVersion);
++        }
++
++        if (mOutStream == null) {
++            openStream();
++        }
++
++        // Make code point conversion table ordered by occurrence of code points
++        // Version 201 or later have codePointTable
++        final CodePointTable codePointTable;
++        if (mCodePointTableMode == CODE_POINT_TABLE_OFF || formatOptions.mVersion
++                < FormatSpec.MINIMUM_SUPPORTED_VERSION_OF_CODE_POINT_TABLE) {
++            codePointTable = new CodePointTable();
++        } else {
++            codePointTable = makeCodePointTable(dict);
++        }
++
++        BinaryDictEncoderUtils.writeDictionaryHeader(mOutStream, dict, formatOptions,
++                codePointTable.mCodePointOccurrenceArray);
++
++        // Addresses are limited to 3 bytes, but since addresses can be relative to each node
++        // array, the structure itself is not limited to 16MB. However, if it is over 16MB deciding
++        // the order of the PtNode arrays becomes a quite complicated problem, because though the
++        // dictionary itself does not have a size limit, each node array must still be within 16MB
++        // of all its children and parents. As long as this is ensured, the dictionary file may
++        // grow to any size.
++
++        // Leave the choice of the optimal node order to the flattenTree function.
++        MakedictLog.i("Flattening the tree...");
++        ArrayList<PtNodeArray> flatNodes = BinaryDictEncoderUtils.flattenTree(dict.mRootNodeArray);
++
++        MakedictLog.i("Computing addresses...");
++        BinaryDictEncoderUtils.computeAddresses(dict, flatNodes,
++                codePointTable.mCodePointToOneByteCodeMap);
++        MakedictLog.i("Checking PtNode array...");
++        if (MakedictLog.DBG) BinaryDictEncoderUtils.checkFlatPtNodeArrayList(flatNodes);
++
++        // Create a buffer that matches the final dictionary size.
++        final PtNodeArray lastNodeArray = flatNodes.get(flatNodes.size() - 1);
++        final int bufferSize = lastNodeArray.mCachedAddressAfterUpdate + lastNodeArray.mCachedSize;
++        mBuffer = new byte[bufferSize];
++
++        MakedictLog.i("Writing file...");
++
++        for (PtNodeArray nodeArray : flatNodes) {
++            BinaryDictEncoderUtils.writePlacedPtNodeArray(dict, this, nodeArray,
++                    codePointTable.mCodePointToOneByteCodeMap);
++        }
++        if (MakedictLog.DBG) BinaryDictEncoderUtils.showStatistics(flatNodes);
++        mOutStream.write(mBuffer, 0, mPosition);
++
++        MakedictLog.i("Done");
++        close();
++    }
++
++    @Override
++    public void setPosition(final int position) {
++        if (mBuffer == null || position < 0 || position >= mBuffer.length) return;
++        mPosition = position;
++    }
++
++    @Override
++    public int getPosition() {
++        return mPosition;
++    }
++
++    @Override
++    public void writePtNodeCount(final int ptNodeCount) {
++        final int countSize = BinaryDictIOUtils.getPtNodeCountSize(ptNodeCount);
++        if (countSize != 1 && countSize != 2) {
++            throw new RuntimeException("Strange size from getGroupCountSize : " + countSize);
++        }
++        final int encodedPtNodeCount = (countSize == 2) ?
++                (ptNodeCount | FormatSpec.LARGE_PTNODE_ARRAY_SIZE_FIELD_SIZE_FLAG) : ptNodeCount;
++        mPosition = BinaryDictEncoderUtils.writeUIntToBuffer(mBuffer, mPosition, encodedPtNodeCount,
++                countSize);
++    }
++
++    private void writePtNodeFlags(final PtNode ptNode,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        final int childrenPos = BinaryDictEncoderUtils.getChildrenPosition(ptNode,
++                codePointToOneByteCodeMap);
++        mPosition = BinaryDictEncoderUtils.writeUIntToBuffer(mBuffer, mPosition,
++                BinaryDictEncoderUtils.makePtNodeFlags(ptNode, childrenPos),
++                FormatSpec.PTNODE_FLAGS_SIZE);
++    }
++
++    private void writeCharacters(final int[] codePoints, final boolean hasSeveralChars,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        mPosition = CharEncoding.writeCharArray(codePoints, mBuffer, mPosition,
++                codePointToOneByteCodeMap);
++        if (hasSeveralChars) {
++            mBuffer[mPosition++] = FormatSpec.PTNODE_CHARACTERS_TERMINATOR;
++        }
++    }
++
++    private void writeFrequency(final int frequency) {
++        if (frequency >= 0) {
++            mPosition = BinaryDictEncoderUtils.writeUIntToBuffer(mBuffer, mPosition, frequency,
++                    FormatSpec.PTNODE_FREQUENCY_SIZE);
++        }
++    }
++
++    private void writeChildrenPosition(final PtNode ptNode,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        final int childrenPos = BinaryDictEncoderUtils.getChildrenPosition(ptNode,
++                codePointToOneByteCodeMap);
++        mPosition += BinaryDictEncoderUtils.writeChildrenPosition(mBuffer, mPosition,
++                childrenPos);
++    }
++
++    /**
++     * Write a bigram attributes list to mBuffer.
++     *
++     * @param bigrams the bigram attributes list.
++     * @param dict the dictionary the node array is a part of (for relative offsets).
++     */
++    private void writeBigrams(final ArrayList<WeightedString> bigrams,
++            final FusionDictionary dict) {
++        if (bigrams == null) return;
++
++        final Iterator<WeightedString> bigramIterator = bigrams.iterator();
++        while (bigramIterator.hasNext()) {
++            final WeightedString bigram = bigramIterator.next();
++            final PtNode target =
++                    FusionDictionary.findWordInTree(dict.mRootNodeArray, bigram.mWord);
++            final int addressOfBigram = target.mCachedAddressAfterUpdate;
++            final int unigramFrequencyForThisWord = target.getProbability();
++            final int offset = addressOfBigram
++                    - (mPosition + FormatSpec.PTNODE_ATTRIBUTE_FLAGS_SIZE);
++            final int bigramFlags = BinaryDictEncoderUtils.makeBigramFlags(bigramIterator.hasNext(),
++                    offset, bigram.getProbability(), unigramFrequencyForThisWord, bigram.mWord);
++            mPosition = BinaryDictEncoderUtils.writeUIntToBuffer(mBuffer, mPosition, bigramFlags,
++                    FormatSpec.PTNODE_ATTRIBUTE_FLAGS_SIZE);
++            mPosition += BinaryDictEncoderUtils.writeChildrenPosition(mBuffer, mPosition,
++                    Math.abs(offset));
++        }
++    }
++
++    @Override
++    public void writePtNode(final PtNode ptNode, final FusionDictionary dict,
++            final HashMap<Integer, Integer> codePointToOneByteCodeMap) {
++        writePtNodeFlags(ptNode, codePointToOneByteCodeMap);
++        writeCharacters(ptNode.mChars, ptNode.hasSeveralChars(), codePointToOneByteCodeMap);
++        writeFrequency(ptNode.getProbability());
++        writeChildrenPosition(ptNode, codePointToOneByteCodeMap);
++        writeBigrams(ptNode.mBigrams, dict);
++    }
++}
+-- 
+2.56.0
+

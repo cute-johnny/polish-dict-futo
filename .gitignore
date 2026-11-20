@@ -1,0 +1,7 @@
+# Separate git repo (the FUTO fork): github.com/cute-johnny/android-keyboard
+futo-keyboard/
+# Build outputs / large or private local files
+work/
+dist/apk/
+docs/
+__pycache__/

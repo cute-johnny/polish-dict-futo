@@ -1,0 +1,50 @@
+From 8e4a88a8917ff2c1e885812d39126a6cae3bde66 Mon Sep 17 00:00:00 2001
+From: cute-johnny <269855522+cute-johnny@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 12:22:51 +0100
+Subject: [PATCH 2/2] Mark modified AOSP encoder file; clarify which encoder
+ class is changed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/large-dict/README.md                                 | 7 ++++---
+ .../inputmethod/latin/makedict/BinaryDictEncoderUtils.java | 6 ++++++
+ 2 files changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/tools/large-dict/README.md b/tools/large-dict/README.md
+index 0f639fc..e9bd253 100644
+--- a/tools/large-dict/README.md
++++ b/tools/large-dict/README.md
+@@ -12,9 +12,10 @@ v203 files as an unknown version instead of misreading them.
+ 
+ ## Building a v203 dictionary
+ 
+-`src/` contains two patched AOSP encoder classes (Apache-2.0, from
+-android.googlesource.com LatinIME master). They are compiled and put on the
+-classpath ahead of the stock `dicttool_aosp.jar`:
++`src/` contains two AOSP encoder classes (Apache-2.0, from android.googlesource.com
++LatinIME master). Only `BinaryDictEncoderUtils.java` is modified. `Ver2DictEncoder.java`
++is unchanged and is compiled alongside it. Both are put on the classpath ahead of the
++stock `dicttool_aosp.jar`:
+ 
+ ```sh
+ # dicttool_aosp.jar: https://codeberg.org/Helium314/aosp-dictionaries (dicttool_aosp.jar)
+diff --git a/tools/large-dict/src/com/android/inputmethod/latin/makedict/BinaryDictEncoderUtils.java b/tools/large-dict/src/com/android/inputmethod/latin/makedict/BinaryDictEncoderUtils.java
+index 4b74ebb..1a0fc4a 100644
+--- a/tools/large-dict/src/com/android/inputmethod/latin/makedict/BinaryDictEncoderUtils.java
++++ b/tools/large-dict/src/com/android/inputmethod/latin/makedict/BinaryDictEncoderUtils.java
+@@ -14,6 +14,12 @@
+  * limitations under the License.
+  */
+ 
++/*
++ * MODIFIED FILE: changed from AOSP LatinIME (master) to add a large-address mode
++ * (-Ddicttool.large=true -> dictionary format version 203 with 4-byte pointers) and to refuse
++ * writing corrupt v202 dictionaries over 16 MiB. See tools/large-dict/README.md.
++ */
++
+ package com.android.inputmethod.latin.makedict;
+ 
+ import com.android.inputmethod.latin.makedict.BinaryDictDecoderUtils.CharEncoding;
+-- 
+2.56.0
+
